@@ -44,6 +44,13 @@ import { SAVE_TO_LOCAL_STORAGE_TIMEOUT, STORAGE_KEYS } from "../app_constants";
 import { FileManager } from "./FileManager";
 import { Locker } from "./Locker";
 import { updateBrowserStateVersion } from "./tabSync";
+import {
+  saveLocalSessionToPostgres,
+  saveLocalSessionToPostgresDebounced,
+  flushLocalSessionToPostgres,
+} from "./PostgresLocalStorage";
+import { saveEventEmitter } from "./SaveEvents";
+import { AuthService } from "./AuthService";
 
 const filesStore = createStore("files-db", "files-store");
 
@@ -121,8 +128,46 @@ export class LocalData {
       files: BinaryFiles,
       onFilesSaved: () => void,
     ) => {
-      saveDataStateToLocalStorage(elements, appState);
+      const isAuthenticated = AuthService.isAuthenticated();
+      console.log('[LocalData] Salvando, autenticado:', isAuthenticated);
+      
+      if (isAuthenticated) {
+        // Se estiver logado, salvar apenas no PostgreSQL
+        console.log('[LocalData] Emitindo saving(postgres)');
+        saveEventEmitter.emitSaving("postgres");
+        
+        try {
+          // Aguardar o salvamento no PostgreSQL completar
+          console.log('[LocalData] Chamando saveLocalSessionToPostgres...');
+          const result = await saveLocalSessionToPostgres(elements, appState, files);
+          console.log('[LocalData] saveLocalSessionToPostgres retornou:', result);
+          // O evento "saved" já é emitido dentro de saveLocalSessionToPostgres
+        } catch (error) {
+          console.warn('[LocalData] Erro ao salvar no PostgreSQL:', error);
+          saveEventEmitter.emitError("postgres");
+        }
+      } else {
+        // Se não estiver logado, salvar no localStorage e PostgreSQL
+        saveEventEmitter.emitSaving("both");
+        
+        try {
+          saveDataStateToLocalStorage(elements, appState);
+          saveEventEmitter.emitSaved("localStorage");
+        } catch (error) {
+          console.error("Erro ao salvar no localStorage:", error);
+          saveEventEmitter.emitError("localStorage");
+        }
+        
+        try {
+          // Para não logados, usar debounced para economizar requisições
+          saveLocalSessionToPostgresDebounced(elements, appState, files);
+        } catch (error) {
+          console.warn('Erro ao salvar no PostgreSQL:', error);
+          saveEventEmitter.emitError("postgres");
+        }
+      }
 
+      // Salvar arquivos no IndexedDB
       await this.fileStorage.saveFiles({
         elements,
         files,
@@ -147,6 +192,10 @@ export class LocalData {
 
   static flushSave = () => {
     this._save.flush();
+    
+    // Também forçar salvamento no PostgreSQL
+    // Nota: elementos e appState não estão disponíveis aqui,
+    // então o flush do PostgreSQL será feito via evento beforeunload no App.tsx
   };
 
   private static locker = new Locker<SavingLockTypes>();

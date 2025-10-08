@@ -38,6 +38,7 @@ import {
 
 import { encodeFilesForUpload } from "./FileManager";
 import { saveFilesToFirebase } from "./firebase";
+import { loadLocalSessionFromPostgres } from "./PostgresLocalStorage";
 
 import type { WS_SUBTYPES } from "../app_constants";
 
@@ -265,10 +266,36 @@ export const loadScene = async (
       },
     );
   } else {
-    data = restore(localDataState || null, null, null, {
-      repairBindings: true,
-      deleteInvisibleElements: true,
-    });
+    // Tentar carregar do PostgreSQL primeiro (apenas se não for colaboração)
+    let postgresData: ImportedDataState | null = null;
+    
+    try {
+      const pgData = await loadLocalSessionFromPostgres();
+      if (pgData && pgData.elements && Array.isArray(pgData.elements)) {
+        console.log('Dados carregados do PostgreSQL:', pgData.elements.length, 'elementos');
+        postgresData = {
+          elements: pgData.elements,
+          appState: pgData.appState,
+          files: pgData.files || {},
+        };
+      }
+    } catch (error) {
+      console.warn('Erro ao carregar do PostgreSQL, usando localStorage:', error);
+    }
+
+    // Usar PostgreSQL se disponível, senão usar localStorage
+    // Sempre passar pelo restore para normalizar os dados
+    const dataToRestore = postgresData || localDataState || null;
+    
+    data = restore(
+      dataToRestore,
+      localDataState?.appState, // Sempre mesclar com appState local para preservar preferências
+      null,
+      {
+        repairBindings: true,
+        deleteInvisibleElements: true,
+      },
+    );
   }
 
   return {
@@ -315,7 +342,7 @@ export const exportToBackend = async (
 
     const response = await fetch(BACKEND_V2_POST, {
       method: "POST",
-      body: payload.buffer,
+      body: payload.buffer as ArrayBuffer,
     });
     const json = await response.json();
     if (json.id) {

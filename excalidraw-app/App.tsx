@@ -62,6 +62,7 @@ import type {
   FileId,
   NonDeletedExcalidrawElement,
   OrderedExcalidrawElement,
+  ExcalidrawElement,
 } from "@excalidraw/element/types";
 import type {
   AppState,
@@ -99,7 +100,15 @@ import {
   ExportToExcalidrawPlus,
   exportToExcalidrawPlus,
 } from "./components/ExportToExcalidrawPlus";
+import { SaveIndicator } from "./components/SaveIndicator";
+import { AuthDialog } from "./components/AuthDialog";
+import { SessionChoiceDialog } from "./components/SessionChoiceDialog";
+import { VersionHistory } from "./components/VersionHistory";
+import { PreviewBanner } from "./components/PreviewBanner";
+import { ViewOnlyBanner } from "./components/ViewOnlyBanner";
+import { useSaveStatus } from "./hooks/useSaveStatus";
 import { TopErrorBoundary } from "./components/TopErrorBoundary";
+import { AuthService } from "./data/AuthService";
 
 import {
   exportToBackend,
@@ -218,7 +227,7 @@ const initializeScene = async (opts: {
   );
   const externalUrlMatch = window.location.hash.match(/^#url=(.*)$/);
 
-  const localDataState = importFromLocalStorage();
+  const localDataState = await importFromLocalStorage();
 
   let scene: RestoredDataState & {
     scrollToContent?: boolean;
@@ -341,6 +350,343 @@ const ExcalidrawWrapper = () => {
   const { editorTheme, appTheme, setAppTheme } = useHandleAppTheme();
 
   const [langCode, setLangCode] = useAppLangCode();
+  
+  // Save status indicator
+  const { status: saveStatus, lastSaved } = useSaveStatus();
+
+  // Auth dialog state
+  const [showAuthDialog, setShowAuthDialog] = useState(false);
+  const [showSessionChoiceDialog, setShowSessionChoiceDialog] = useState(false);
+  const [showVersionHistory, setShowVersionHistory] = useState(false);
+  const [previewState, setPreviewState] = useState<{
+    elements: readonly ExcalidrawElement[];
+    appState: AppState;
+    files: BinaryFiles;
+  } | null>(null);
+  const [sessionChoiceData, setSessionChoiceData] = useState<{
+    localElements: readonly ExcalidrawElement[];
+    localAppState: AppState;
+    localFiles: BinaryFiles;
+    remoteElements: readonly ExcalidrawElement[];
+    remoteAppState: Partial<AppState>;
+    remoteFiles: BinaryFiles;
+    token: string;
+    username: string;
+  } | null>(null);
+  const [currentUsername, setCurrentUsername] = useState<string | null>(
+    AuthService.getUsername()
+  );
+  const [isViewOnlyMode, setIsViewOnlyMode] = useState(false);
+  const [currentDiagramName, setCurrentDiagramName] = useState<string | null>(null);
+  const sessionCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const hasActiveControlRef = useRef(false);
+
+  // Verificar autenticação no mount
+  useEffect(() => {
+    const validateAuth = async () => {
+      if (AuthService.isAuthenticated()) {
+        const isValid = await AuthService.validateToken();
+        if (!isValid) {
+          setCurrentUsername(null);
+        }
+      }
+    };
+    validateAuth();
+  }, []);
+
+  // Carregar nome do diagrama atual
+  useEffect(() => {
+    const loadDiagramName = async () => {
+      if (currentUsername) {
+        const { getCurrentDiagramName } = await import("./data/PostgresLocalStorage");
+        const name = await getCurrentDiagramName();
+        console.log('[App] Loaded diagram name:', name);
+        setCurrentDiagramName(name);
+      } else {
+        setCurrentDiagramName(null);
+      }
+    };
+    
+    loadDiagramName();
+    
+    // Listener para mudanças no nome do diagrama
+    const handleDiagramNameChanged = (event: CustomEvent) => {
+      console.log('[App] Diagram name changed event:', event.detail.diagramName);
+      setCurrentDiagramName(event.detail.diagramName);
+    };
+    
+    window.addEventListener('diagram-name-changed', handleDiagramNameChanged as EventListener);
+    
+    return () => {
+      window.removeEventListener('diagram-name-changed', handleDiagramNameChanged as EventListener);
+    };
+  }, [currentUsername]);
+
+  const handleAuthSuccess = async (token: string, username: string) => {
+    // Salvar credenciais temporariamente
+    AuthService.saveAuth(token, username);
+    
+    // Verificar se há desenho local
+    const currentElements = excalidrawAPI?.getSceneElements() || [];
+    const currentAppState = excalidrawAPI?.getAppState() || {};
+    const currentFiles = excalidrawAPI?.getFiles() || {};
+    
+    const hasLocalContent = currentElements.length > 0;
+    
+    if (hasLocalContent) {
+      // Tentar carregar dados do servidor
+      try {
+        const { loadLocalSessionFromPostgres } = await import("./data/PostgresLocalStorage");
+        const remoteData = await loadLocalSessionFromPostgres();
+        
+        if (remoteData && remoteData.elements && remoteData.elements.length > 0) {
+          // Há dados tanto locais quanto remotos - mostrar escolha
+          setSessionChoiceData({
+            localElements: currentElements,
+            localAppState: currentAppState as AppState,
+            localFiles: currentFiles,
+            remoteElements: remoteData.elements,
+            remoteAppState: remoteData.appState,
+            remoteFiles: remoteData.files || {},
+            token,
+            username,
+          });
+          setShowSessionChoiceDialog(true);
+          setShowAuthDialog(false);
+          return;
+        }
+      } catch (error) {
+        console.error('Erro ao verificar sessão remota:', error);
+      }
+    }
+    
+    // Caso padrão: apenas recarregar
+    setCurrentUsername(username);
+    window.location.reload();
+  };
+
+  const handleSessionChoice = async (choice: "load" | "keep") => {
+    if (!sessionChoiceData) return;
+    
+    const { loadLocalSessionFromPostgres, saveSessionVersion, saveLocalSessionToPostgres, claimActiveSession } = 
+      await import("./data/PostgresLocalStorage");
+    
+    if (choice === "keep") {
+      // Manter desenho local, mas salvar o remoto como versão
+      try {
+        // Salvar versão do desenho remoto (atual do banco)
+        await saveSessionVersion(
+          sessionChoiceData.remoteElements,
+          sessionChoiceData.remoteAppState as AppState,
+          sessionChoiceData.remoteFiles
+        );
+        
+        // Salvar desenho local como sessão principal
+        await saveLocalSessionToPostgres(
+          sessionChoiceData.localElements,
+          sessionChoiceData.localAppState,
+          sessionChoiceData.localFiles
+        );
+        
+        console.log('Desenho local mantido, versão remota salva como backup');
+      } catch (error) {
+        console.error('Erro ao salvar versão:', error);
+      }
+    } else {
+      // Carregar desenho remoto, descartar local
+      try {
+        excalidrawAPI?.updateScene({
+          elements: sessionChoiceData.remoteElements,
+          appState: sessionChoiceData.remoteAppState as AppState,
+        });
+        
+        // Atualizar arquivos separadamente
+        if (sessionChoiceData.remoteFiles && Object.keys(sessionChoiceData.remoteFiles).length > 0) {
+          excalidrawAPI?.addFiles(Object.values(sessionChoiceData.remoteFiles));
+        }
+        
+        console.log('Desenho remoto carregado, local descartado');
+      } catch (error) {
+        console.error('Erro ao carregar desenho remoto:', error);
+      }
+    }
+    
+    setCurrentUsername(sessionChoiceData.username);
+    setSessionChoiceData(null);
+  };
+
+  const handleRestoreVersion = async (versionId: number) => {
+    try {
+      // Se estiver em preview, limpar o estado de preview primeiro
+      if (previewState) {
+        setPreviewState(null);
+      }
+      
+      const { loadSessionVersion, saveSessionVersion } = 
+        await import("./data/PostgresLocalStorage");
+      
+      // Salvar versão atual como backup (a menos que seja um preview)
+      const currentElements = excalidrawAPI?.getSceneElements() || [];
+      const currentAppState = excalidrawAPI?.getAppState() || {};
+      const currentFiles = excalidrawAPI?.getFiles() || {};
+      
+      if (currentElements.length > 0 && !previewState) {
+        await saveSessionVersion(
+          currentElements,
+          currentAppState as AppState,
+          currentFiles
+        );
+        console.log('Versão atual salva como backup');
+      }
+      
+      // Carregar versão selecionada
+      const versionData = await loadSessionVersion(versionId);
+      
+      if (versionData) {
+        excalidrawAPI?.updateScene({
+          elements: versionData.elements,
+          appState: versionData.appState as AppState,
+        });
+        
+        // Atualizar arquivos
+        if (versionData.files && Object.keys(versionData.files).length > 0) {
+          excalidrawAPI?.addFiles(Object.values(versionData.files));
+        }
+        
+        console.log('Versão restaurada com sucesso');
+      }
+    } catch (error) {
+      console.error('Erro ao restaurar versão:', error);
+      throw error;
+    }
+  };
+
+  const handlePreviewVersion = async (versionId: number) => {
+    try {
+      // Se ainda não estamos em modo preview, salvar o estado atual
+      if (!previewState) {
+        const currentElements = excalidrawAPI?.getSceneElements() || [];
+        const currentAppState = excalidrawAPI?.getAppState() || {} as AppState;
+        const currentFiles = excalidrawAPI?.getFiles() || {};
+        
+        setPreviewState({
+          elements: currentElements,
+          appState: currentAppState,
+          files: currentFiles,
+        });
+      }
+      
+      const { loadSessionVersion } = 
+        await import("./data/PostgresLocalStorage");
+      
+      // Carregar versão para preview
+      const versionData = await loadSessionVersion(versionId);
+      
+      if (versionData) {
+        excalidrawAPI?.updateScene({
+          elements: versionData.elements,
+          appState: {
+            ...versionData.appState,
+            viewBackgroundColor: versionData.appState?.viewBackgroundColor || "#ffffff",
+          } as AppState,
+        });
+        
+        // Atualizar arquivos
+        if (versionData.files && Object.keys(versionData.files).length > 0) {
+          excalidrawAPI?.addFiles(Object.values(versionData.files));
+        }
+        
+        console.log('Preview da versão carregado (estado atual salvo)');
+      }
+    } catch (error) {
+      console.error('Erro ao visualizar versão:', error);
+      throw error;
+    }
+  };
+
+  const handleCancelPreview = () => {
+    if (previewState && excalidrawAPI) {
+      // Restaurar o estado salvo antes do preview
+      excalidrawAPI.updateScene({
+        elements: previewState.elements,
+        appState: previewState.appState,
+      });
+      
+      // Restaurar arquivos
+      if (previewState.files && Object.keys(previewState.files).length > 0) {
+        excalidrawAPI.addFiles(Object.values(previewState.files));
+      }
+      
+      setPreviewState(null);
+      console.log('Preview cancelado, estado original restaurado');
+    }
+  };
+
+  const handleLogout = async () => {
+    // Liberar sessão antes de deslogar
+    if (currentUsername && !isViewOnlyMode) {
+      const { releaseActiveSession, saveSessionVersion } = await import("./data/PostgresLocalStorage");
+      
+      // Salvar estado atual
+      const elements = excalidrawAPI?.getSceneElements();
+      const appState = excalidrawAPI?.getAppState();
+      const files = excalidrawAPI?.getFiles();
+      
+      if (elements && appState) {
+        await saveSessionVersion(
+          elements,
+          appState,
+          files || {},
+          false,
+          undefined,
+          "Salvamento automático ao sair"
+        );
+      }
+      
+      await releaseActiveSession();
+    }
+    
+    AuthService.clearAuth();
+    setCurrentUsername(null);
+    // Recarregar para limpar estado
+    window.location.reload();
+  };
+
+  const handleTakeControl = async () => {
+    const { transferSessionControl } = await import("./data/PostgresLocalStorage");
+    const success = await transferSessionControl();
+    
+    if (success) {
+      console.log('[Session] Controle transferido com sucesso');
+      hasActiveControlRef.current = true;
+      setIsViewOnlyMode(false);
+      
+      // Limpar intervalo antigo
+      if (sessionCheckIntervalRef.current) {
+        clearInterval(sessionCheckIntervalRef.current);
+        sessionCheckIntervalRef.current = null;
+      }
+      
+      // Reiniciar heartbeat loop
+      const { sendSessionHeartbeat } = await import("./data/PostgresLocalStorage");
+      const checkSessionStatus = async () => {
+        if (hasActiveControlRef.current) {
+          const result = await sendSessionHeartbeat();
+          const isActive = result.isActive;
+          setIsViewOnlyMode(!isActive);
+          hasActiveControlRef.current = isActive;
+          
+          if (!isActive) {
+            console.log('[Session] Controle perdido durante heartbeat');
+          }
+        }
+      };
+      
+      sessionCheckIntervalRef.current = setInterval(checkSessionStatus, 5000);
+    } else {
+      console.error('[Session] Falha ao transferir controle');
+    }
+  };
 
   // initial state
   // ---------------------------------------------------------------------------
@@ -365,6 +711,115 @@ const ExcalidrawWrapper = () => {
 
   const [excalidrawAPI, excalidrawRefCallback] =
     useCallbackRefState<ExcalidrawImperativeAPI>();
+
+  // Controle de sessão ativa
+  useEffect(() => {
+    console.log('[Session] useEffect triggered, currentUsername:', currentUsername, 'diagramName:', currentDiagramName);
+    
+    if (!currentUsername) {
+      console.log('[Session] No username, disabling view-only mode');
+      setIsViewOnlyMode(false);
+      hasActiveControlRef.current = false;
+      if (sessionCheckIntervalRef.current) {
+        clearInterval(sessionCheckIntervalRef.current);
+        sessionCheckIntervalRef.current = null;
+      }
+      return;
+    }
+
+    let isFirstCall = true;
+
+    const checkSessionStatus = async () => {
+      console.log('[Session] checkSessionStatus called, isFirstCall:', isFirstCall, 'hasActiveControl:', hasActiveControlRef.current, 'diagramName:', currentDiagramName);
+      
+      const { claimActiveSession, sendSessionHeartbeat, getCurrentDiagramName } = await import("./data/PostgresLocalStorage");
+      
+      // Obter nome do diagrama atualizado
+      const latestDiagramName = await getCurrentDiagramName();
+      if (latestDiagramName !== currentDiagramName) {
+        console.log('[Session] Diagram name changed from', currentDiagramName, 'to', latestDiagramName);
+        setCurrentDiagramName(latestDiagramName);
+      }
+      
+      // Primeira chamada: reivindicar sessão
+      if (isFirstCall) {
+        isFirstCall = false;
+        console.log('[Session] First call - claiming session');
+        const result = await claimActiveSession(latestDiagramName);
+        console.log('[Session] Claim result:', result);
+        const isActive = result.isActive;
+        setIsViewOnlyMode(!isActive);
+        hasActiveControlRef.current = isActive;
+      } else {
+        // Apenas enviar heartbeat se tivermos controle ativo
+        if (hasActiveControlRef.current) {
+          console.log('[Session] Sending heartbeat');
+          const result = await sendSessionHeartbeat(latestDiagramName);
+          console.log('[Session] Heartbeat result:', result);
+          const isActive = result.isActive;
+          setIsViewOnlyMode(!isActive);
+          hasActiveControlRef.current = isActive;
+          
+          // Se perdemos o controle, parar de enviar heartbeat
+          if (!isActive) {
+            console.log('[Session] Controle perdido, parando heartbeat');
+          }
+        } else {
+          console.log('[Session] Skipping heartbeat - no active control');
+        }
+      }
+    };
+
+    // Chamar imediatamente
+    checkSessionStatus();
+
+    // Verificar a cada 5 segundos
+    sessionCheckIntervalRef.current = setInterval(checkSessionStatus, 5000);
+
+    // Cleanup ao desmontar ou deslogar
+    return () => {
+      console.log('[Session] Cleaning up session control');
+      if (sessionCheckIntervalRef.current) {
+        clearInterval(sessionCheckIntervalRef.current);
+        sessionCheckIntervalRef.current = null;
+      }
+      hasActiveControlRef.current = false;
+    };
+  }, [currentUsername, currentDiagramName]);
+
+  // Liberar sessão ao fechar/sair
+  useEffect(() => {
+    const handleBeforeUnload = async () => {
+      if (currentUsername && !isViewOnlyMode && excalidrawAPI) {
+        const { releaseActiveSession, saveSessionVersion } = await import("./data/PostgresLocalStorage");
+        
+        // Salvar estado atual antes de sair
+        const elements = excalidrawAPI.getSceneElements();
+        const appState = excalidrawAPI.getAppState();
+        const files = excalidrawAPI.getFiles();
+        
+        if (elements && appState) {
+          await saveSessionVersion(
+            elements,
+            appState,
+            files || {},
+            false,
+            undefined,
+            "Salvamento automático ao fechar"
+          );
+        }
+        
+        await releaseActiveSession();
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      handleBeforeUnload(); // Tentar liberar ao desmontar componente
+    };
+  }, [currentUsername, isViewOnlyMode, excalidrawAPI]);
 
   const [, setShareDialogState] = useAtom(shareDialogStateAtom);
   const [collabAPI] = useAtom(collabAPIAtom);
@@ -396,6 +851,42 @@ const ExcalidrawWrapper = () => {
       forceRefresh((prev) => !prev);
     }
   }, [excalidrawAPI]);
+
+  // Auto-save a cada 10 minutos para usuários logados
+  useEffect(() => {
+    if (!currentUsername || !excalidrawAPI) {
+      return;
+    }
+
+    console.log('[AutoSave] Timer iniciado - salvando versão a cada 10 minutos');
+
+    const autoSaveInterval = setInterval(async () => {
+      try {
+        const elements = excalidrawAPI.getSceneElements();
+        const appState = excalidrawAPI.getAppState();
+        const files = excalidrawAPI.getFiles();
+
+        // Só salvar se houver conteúdo
+        if (elements.length > 0) {
+          const { saveSessionVersion } = await import("./data/PostgresLocalStorage");
+          await saveSessionVersion(
+            elements,
+            appState as AppState,
+            files,
+            true // isAutoSave = true
+          );
+          console.log('[AutoSave] Versão automática salva com sucesso');
+        }
+      } catch (error) {
+        console.error('[AutoSave] Erro ao salvar versão automática:', error);
+      }
+    }, 10 * 60 * 1000); // 10 minutos em milissegundos
+
+    return () => {
+      console.log('[AutoSave] Timer removido');
+      clearInterval(autoSaveInterval);
+    };
+  }, [currentUsername, excalidrawAPI]);
 
   useEffect(() => {
     if (!excalidrawAPI || (!isCollabDisabled && !collabAPI)) {
@@ -499,7 +990,7 @@ const ExcalidrawWrapper = () => {
       }
     };
 
-    const syncData = debounce(() => {
+    const syncData = debounce(async () => {
       if (isTestEnv()) {
         return;
       }
@@ -509,13 +1000,22 @@ const ExcalidrawWrapper = () => {
       ) {
         // don't sync if local state is newer or identical to browser state
         if (isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_DATA_STATE)) {
-          const localDataState = importFromLocalStorage();
+          const localDataState = await importFromLocalStorage();
           const username = importUsernameFromLocalStorage();
           setLangCode(getPreferredLanguage());
+          console.log('[App.tsx] Sincronizando dados, files:', localDataState.files ? Object.keys(localDataState.files).length : 0);
           excalidrawAPI.updateScene({
-            ...localDataState,
+            elements: localDataState.elements,
+            appState: localDataState.appState as any,
             captureUpdate: CaptureUpdateAction.NEVER,
           });
+          // Adicionar arquivos se existirem
+          if (localDataState.files && Object.keys(localDataState.files).length > 0) {
+            const filesArray = Object.values(localDataState.files);
+            console.log('[App.tsx] Adicionando files:', filesArray.length);
+            console.log('[App.tsx] Primeiro file:', filesArray[0] ? { id: filesArray[0].id, mimeType: filesArray[0].mimeType, hasDataURL: !!filesArray[0].dataURL } : 'nenhum');
+            excalidrawAPI.addFiles(filesArray);
+          }
           LibraryIndexedDBAdapter.load().then((data) => {
             if (data) {
               excalidrawAPI.updateLibrary({
@@ -624,6 +1124,11 @@ const ExcalidrawWrapper = () => {
   ) => {
     if (collabAPI?.isCollaborating()) {
       collabAPI.syncElements(elements);
+    }
+
+    // Bloquear salvamento se estiver em modo somente visualização
+    if (isViewOnlyMode) {
+      return;
     }
 
     // this check is redundant, but since this is a hot path, it's best
@@ -806,6 +1311,7 @@ const ExcalidrawWrapper = () => {
         initialData={initialStatePromiseRef.current.promise}
         isCollaborating={isCollaborating}
         onPointerUpdate={collabAPI?.onPointerUpdate}
+        viewModeEnabled={isViewOnlyMode}
         UIOptions={{
           canvasActions: {
             toggleTheme: true,
@@ -1144,6 +1650,72 @@ const ExcalidrawWrapper = () => {
           />
         )}
       </Excalidraw>
+      
+      {/* Save Status Indicator */}
+      {!isCollaborating && (
+        <SaveIndicator 
+          status={saveStatus} 
+          lastSaved={lastSaved}
+          username={currentUsername}
+          onLoginClick={() => setShowAuthDialog(true)}
+          onLogoutClick={handleLogout}
+          onVersionHistoryClick={() => setShowVersionHistory(true)}
+          onNewDiagram={() => {
+            // Limpar canvas
+            excalidrawAPI?.updateScene({
+              elements: [],
+              appState: {}
+            });
+            // Forçar novo session_id no próximo salvamento
+            sessionStorage.removeItem("excalidraw-session-id");
+          }}
+          elements={excalidrawAPI?.getSceneElements()}
+          appState={excalidrawAPI?.getAppState()}
+          files={excalidrawAPI?.getFiles()}
+        />
+      )}
+
+      {/* Preview Mode Banner */}
+      {!isCollaborating && previewState && (
+        <PreviewBanner
+          onOpenHistory={() => setShowVersionHistory(true)}
+          onCancelPreview={handleCancelPreview}
+        />
+      )}
+
+      {/* View Only Mode Banner */}
+      {!isCollaborating && currentUsername && isViewOnlyMode && (
+        <ViewOnlyBanner
+          onTakeControl={handleTakeControl}
+        />
+      )}
+
+      {/* Auth Dialog */}
+      <AuthDialog
+        isOpen={showAuthDialog}
+        onClose={() => setShowAuthDialog(false)}
+        onSuccess={handleAuthSuccess}
+      />
+
+      {/* Session Choice Dialog */}
+      <SessionChoiceDialog
+        isOpen={showSessionChoiceDialog}
+        onClose={() => {
+          setShowSessionChoiceDialog(false);
+          setSessionChoiceData(null);
+        }}
+        onChoice={handleSessionChoice}
+        localElementCount={sessionChoiceData?.localElements.length || 0}
+        remoteElementCount={sessionChoiceData?.remoteElements.length || 0}
+      />
+
+      {/* Version History Dialog */}
+      <VersionHistory
+        isOpen={showVersionHistory}
+        onClose={() => setShowVersionHistory(false)}
+        onRestore={handleRestoreVersion}
+        onPreview={handlePreviewVersion}
+      />
     </div>
   );
 };

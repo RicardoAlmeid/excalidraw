@@ -1,9 +1,26 @@
 services:
+  postgres-api:
+    build:
+      context: ./postgres-api
+    container_name: excalidraw-postgres-api
+    ports:
+      - "4001:4001"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    depends_on:
+      - postgres
+
   excalidraw:
     build:
       context: .
       args:
         - NODE_ENV=development
+        - VITE_APP_REMOTE_STORAGE=postgres
+        - VITE_APP_POSTGRES_API_BASE_URL=http://localhost:4001
     container_name: excalidraw
     ports:
       - "3000:80"
@@ -11,13 +28,26 @@ services:
     stdin_open: true
     healthcheck:
       disable: true
-    environment:
-      - NODE_ENV=development
     volumes:
       - ./:/opt/node_app/app:delegated
       - ./package.json:/opt/node_app/package.json
       - ./yarn.lock:/opt/node_app/yarn.lock
       - notused:/opt/node_app/app/node_modules
+    depends_on:
+      - postgres
+      - postgres-api
+
+  postgres:
+    image: supabase/postgres:15.1.0.117
+    container_name: excalidraw-db
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
 
 volumes:
   notused:
+  postgres-data:

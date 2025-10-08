@@ -5,9 +5,11 @@ import {
 import { clearElementsForLocalStorage } from "@excalidraw/element";
 
 import type { ExcalidrawElement } from "@excalidraw/element/types";
-import type { AppState } from "@excalidraw/excalidraw/types";
+import type { AppState, BinaryFiles } from "@excalidraw/excalidraw/types";
 
 import { STORAGE_KEYS } from "../app_constants";
+import { loadLocalSessionFromPostgres } from "./PostgresLocalStorage";
+import { AuthService } from "./AuthService";
 
 export const saveUsernameToLocalStorage = (username: string) => {
   try {
@@ -35,7 +37,38 @@ export const importUsernameFromLocalStorage = (): string | null => {
   return null;
 };
 
-export const importFromLocalStorage = () => {
+export const importFromLocalStorage = async (): Promise<{
+  elements: ExcalidrawElement[];
+  appState: Partial<AppState> | null;
+  files?: BinaryFiles;
+}> => {
+  // Primeiro, tentar carregar do PostgreSQL se o usuário estiver autenticado
+  if (AuthService.isAuthenticated()) {
+    try {
+      console.log('[localStorage] Usuário autenticado, tentando carregar do PostgreSQL...');
+      const postgresData = await loadLocalSessionFromPostgres();
+      if (postgresData) {
+        console.log('[localStorage] Dados carregados do PostgreSQL:', {
+          elements: postgresData.elements.length,
+          files: postgresData.files ? Object.keys(postgresData.files).length : 0,
+        });
+        return {
+          elements: clearElementsForLocalStorage(postgresData.elements),
+          appState: postgresData.appState
+            ? {
+                ...getDefaultAppState(),
+                ...clearAppStateForLocalStorage(postgresData.appState as Partial<AppState>),
+              }
+            : null,
+          files: postgresData.files,
+        };
+      }
+    } catch (error) {
+      console.warn('[localStorage] Erro ao carregar do PostgreSQL, fallback para localStorage:', error);
+    }
+  }
+
+  // Fallback: carregar do localStorage
   let savedElements = null;
   let savedState = null;
 
@@ -71,6 +104,11 @@ export const importFromLocalStorage = () => {
       // Do nothing because appState is already null
     }
   }
+  
+  console.log('[localStorage] Dados carregados do localStorage:', {
+    elements: elements.length,
+  });
+  
   return { elements, appState };
 };
 
