@@ -47,11 +47,35 @@ export const SaveIndicator = ({
         setCurrentDiagramName(name);
         if (name) {
           setDiagramName(name);
+        } else {
+          // Se não há nome, mostrar campo de edição automaticamente
+          setTimeout(() => {
+            setKeepTooltipOpen(true);
+            setShowDetails(true);
+          }, 1000);
         }
       }
     };
     loadDiagramName();
   }, [username]);
+
+  // Escutar evento de diagrama carregado
+  useEffect(() => {
+    const handleDiagramLoaded = (event: CustomEvent) => {
+      const { diagramName } = event.detail;
+      if (diagramName) {
+        setDiagramName(diagramName);
+        setCurrentDiagramName(diagramName);
+        console.log('[SaveIndicator] Nome do diagrama atualizado:', diagramName);
+      }
+    };
+
+    window.addEventListener('diagram-loaded', handleDiagramLoaded as EventListener);
+    
+    return () => {
+      window.removeEventListener('diagram-loaded', handleDiagramLoaded as EventListener);
+    };
+  }, []);
 
   // Handler para salvar nome do diagrama e nota da versão
   const handleSaveDiagramName = async () => {
@@ -61,35 +85,69 @@ export const SaveIndicator = ({
     setNameSaveSuccess(false);
 
     try {
-      // 1. Atualizar nome do diagrama em todas as versões existentes
-      const updated = await updateDiagramName(diagramName.trim());
+      const newName = diagramName.trim();
+      const isNameChange = currentDiagramName && currentDiagramName !== newName;
       
-      // 2. Criar uma nova versão com o nome e nota (salvamento manual)
-      if (elements && appState) {
-        await saveSessionVersion(
-          elements, 
-          appState, 
-          files || {}, 
-          false, 
-          diagramName.trim(),
-          versionNote.trim() || null
-        );
-      }
-      
-      if (updated) {
-        setCurrentDiagramName(diagramName.trim());
+      if (isNameChange) {
+        // FORK: Nome mudou - criar novo diagrama (novo session_id)
+        console.log(`[SaveIndicator] Nome mudou de "${currentDiagramName}" para "${newName}" - criando fork`);
+        
+        // Salvar versão atual antes do fork
+        if (elements && appState) {
+          await saveSessionVersion(
+            elements, 
+            appState, 
+            files || {}, 
+            false, 
+            currentDiagramName,
+            "Versão antes de renomear diagrama"
+          );
+        }
+        
+        // Emitir evento para criar novo session_id
+        window.dispatchEvent(new CustomEvent('diagram-fork', { 
+          detail: { newDiagramName: newName } 
+        }));
+        
+        setCurrentDiagramName(newName);
         setIsEditingName(false);
         setNameSaveSuccess(true);
-        
-        // Emitir evento para notificar App.tsx sobre mudança no nome do diagrama
-        window.dispatchEvent(new CustomEvent('diagram-name-changed', { 
-          detail: { diagramName: diagramName.trim() } 
-        }));
         
         setTimeout(() => {
           setNameSaveSuccess(false);
           setVersionNote("");
         }, 2000);
+      } else {
+        // Primeiro salvamento ou mesmo nome - apenas atualizar
+        const updated = await updateDiagramName(newName);
+        
+        // Criar uma nova versão com o nome e nota (salvamento manual)
+        if (elements && appState) {
+          await saveSessionVersion(
+            elements, 
+            appState, 
+            files || {}, 
+            false, 
+            newName,
+            versionNote.trim() || null
+          );
+        }
+        
+        if (updated) {
+          setCurrentDiagramName(newName);
+          setIsEditingName(false);
+          setNameSaveSuccess(true);
+          
+          // Emitir evento para notificar App.tsx sobre mudança no nome do diagrama
+          window.dispatchEvent(new CustomEvent('diagram-name-changed', { 
+            detail: { diagramName: newName } 
+          }));
+          
+          setTimeout(() => {
+            setNameSaveSuccess(false);
+            setVersionNote("");
+          }, 2000);
+        }
       }
     } catch (error) {
       console.error("Erro ao salvar nome do diagrama:", error);
@@ -173,8 +231,8 @@ export const SaveIndicator = ({
       case "saved":
         return {
           icon: (
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M14 7.5c1.5 0 3 1 3 3 0 2-1.5 3-3 3H6c-2 0-3.5-1.5-3.5-3.5S4 6.5 6 6.5c0-2.5 2-4.5 4.5-4.5 2 0 3.7 1.3 4.3 3.1" />
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 7.5c1.5 0 3 1 3 3 0 2-1.5 3-3 3H6c-2 0-3.5-1.5-3.5-3.5S4 6.5 6 6.5c0-2.5 2-4.5 4.5-4.5 2 0 3.7 1.3 4.3 3.1" stroke="#4ade80" />
             </svg>
           ),
           text: "Salvo",
@@ -184,8 +242,8 @@ export const SaveIndicator = ({
       case "saving":
         return {
           icon: (
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M14 7.5c1.5 0 3 1 3 3 0 2-1.5 3-3 3H6c-2 0-3.5-1.5-3.5-3.5S4 6.5 6 6.5c0-2.5 2-4.5 4.5-4.5 2 0 3.7 1.3 4.3 3.1" />
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 7.5c1.5 0 3 1 3 3 0 2-1.5 3-3 3H6c-2 0-3.5-1.5-3.5-3.5S4 6.5 6 6.5c0-2.5 2-4.5 4.5-4.5 2 0 3.7 1.3 4.3 3.1" stroke="#60a5fa" />
             </svg>
           ),
           text: "Salvando...",
@@ -195,9 +253,9 @@ export const SaveIndicator = ({
       case "error":
         return {
           icon: (
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M14 7.5c1.5 0 3 1 3 3 0 2-1.5 3-3 3H6c-2 0-3.5-1.5-3.5-3.5S4 6.5 6 6.5c0-2.5 2-4.5 4.5-4.5 2 0 3.7 1.3 4.3 3.1" />
-              <path d="M10 8v4M10 14h.01" />
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 7.5c1.5 0 3 1 3 3 0 2-1.5 3-3 3H6c-2 0-3.5-1.5-3.5-3.5S4 6.5 6 6.5c0-2.5 2-4.5 4.5-4.5 2 0 3.7 1.3 4.3 3.1" stroke="#f87171" />
+              <path d="M10 8v4M10 14h.01" stroke="#f87171" />
             </svg>
           ),
           text: "Erro ao salvar",
@@ -207,8 +265,8 @@ export const SaveIndicator = ({
       default:
         return {
           icon: (
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M14 7.5c1.5 0 3 1 3 3 0 2-1.5 3-3 3H6c-2 0-3.5-1.5-3.5-3.5S4 6.5 6 6.5c0-2.5 2-4.5 4.5-4.5 2 0 3.7 1.3 4.3 3.1" />
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 7.5c1.5 0 3 1 3 3 0 2-1.5 3-3 3H6c-2 0-3.5-1.5-3.5-3.5S4 6.5 6 6.5c0-2.5 2-4.5 4.5-4.5 2 0 3.7 1.3 4.3 3.1" stroke="#94a3b8" />
             </svg>
           ),
           text: "Não salvo",
@@ -302,8 +360,23 @@ export const SaveIndicator = ({
                   
                   {/* Campos para nomear diagrama e adicionar nota */}
                   <div className="save-indicator__diagram-fields">
+                    {!currentDiagramName && !isEditingName && (
+                      <div style={{ 
+                        background: '#fef3c7', 
+                        color: '#92400e', 
+                        padding: '8px', 
+                        borderRadius: '6px', 
+                        fontSize: '0.75rem',
+                        marginBottom: '12px',
+                        textAlign: 'center',
+                        fontWeight: 600
+                      }}>
+                        ⚠️ Defina um nome para habilitar salvamento automático
+                      </div>
+                    )}
+                    
                     <div className="save-indicator__field-group">
-                      <label className="save-indicator__field-label">Nome do Diagrama</label>
+                      <label className="save-indicator__field-label">Nome do Diagrama *</label>
                       {currentDiagramName && !isEditingName ? (
                         <div className="save-indicator__diagram-display">
                           <span className="save-indicator__diagram-name">{currentDiagramName}</span>
@@ -329,6 +402,7 @@ export const SaveIndicator = ({
                           disabled={isSavingName}
                           className="save-indicator__diagram-input"
                           maxLength={100}
+                          autoFocus={!currentDiagramName}
                         />
                       )}
                     </div>

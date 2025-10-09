@@ -52,6 +52,17 @@ export const importFromLocalStorage = async (): Promise<{
           elements: postgresData.elements.length,
           files: postgresData.files ? Object.keys(postgresData.files).length : 0,
         });
+        
+        // Emitir evento com o nome do diagrama se disponível
+        if (postgresData.diagramName) {
+          setTimeout(() => {
+            window.dispatchEvent(new CustomEvent('diagram-loaded', {
+              detail: { diagramName: postgresData.diagramName }
+            }));
+            console.log('[localStorage] Evento diagram-loaded emitido:', postgresData.diagramName);
+          }, 100);
+        }
+        
         return {
           elements: clearElementsForLocalStorage(postgresData.elements),
           appState: postgresData.appState
