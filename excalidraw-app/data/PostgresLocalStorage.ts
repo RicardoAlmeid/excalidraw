@@ -108,6 +108,8 @@ export const saveLocalSessionToPostgres = async (
   elements: readonly ExcalidrawElement[],
   appState: AppState,
   files: BinaryFiles = {},
+  diagramName?: string | null,
+  skipFileLoad?: boolean,
 ): Promise<boolean> => {
   const userId = getUserId();
   
@@ -115,6 +117,9 @@ export const saveLocalSessionToPostgres = async (
     // Limpar dados antes de salvar (remove propriedades internas/temporárias)
     const cleanedElements = clearElementsForLocalStorage(elements);
     const cleanedAppState = clearAppStateForLocalStorage(appState);
+    
+    // Obter o nome do diagrama (usar parâmetro se fornecido, senão buscar)
+    const currentDiagramName = diagramName !== undefined ? diagramName : await getCurrentDiagramName();
     
     // Converter files para formato serializável
     const filesData: Record<string, { 
@@ -138,8 +143,9 @@ export const saveLocalSessionToPostgres = async (
     console.log('[PostgresLocalStorage] FilesData preparado:', Object.keys(filesData).length, 'arquivos');
     
     // Se não há arquivos para salvar, carregar os existentes para preservá-los
+    // EXCETO se skipFileLoad=true (usado em forks para evitar carregar session_id antigo)
     let finalFilesData = filesData;
-    if (Object.keys(filesData).length === 0) {
+    if (Object.keys(filesData).length === 0 && !skipFileLoad) {
       console.log('[PostgresLocalStorage] Nenhum arquivo novo, verificando arquivos existentes...');
       try {
         const existingSession = await loadLocalSessionFromPostgres();
@@ -159,6 +165,8 @@ export const saveLocalSessionToPostgres = async (
       } catch (error) {
         console.warn('[PostgresLocalStorage] Erro ao carregar arquivos existentes:', error);
       }
+    } else if (skipFileLoad) {
+      console.log('[PostgresLocalStorage] Skip file load ativado (fork) - usando arquivos fornecidos');
     }
     
     const response = await fetch(`${LOCAL_SESSIONS_ENDPOINT}/${userId}`, {
@@ -170,6 +178,7 @@ export const saveLocalSessionToPostgres = async (
         elements: cleanedElements,
         appState: cleanedAppState,
         files: finalFilesData,
+        diagramName: currentDiagramName,
       }),
     });
 
@@ -198,6 +207,7 @@ export const loadLocalSessionFromPostgres = async (): Promise<{
   elements: ExcalidrawElement[];
   appState: Partial<AppState>;
   files?: BinaryFiles;
+  diagramName?: string | null;
 } | null> => {
   const userId = getUserId();
   
@@ -222,6 +232,7 @@ export const loadLocalSessionFromPostgres = async (): Promise<{
     const data = await response.json();
     console.log('[PostgresLocalStorage] Sessão local carregada do PostgreSQL com sucesso');
     console.log('[PostgresLocalStorage] Files recebidos do servidor:', data.files ? Object.keys(data.files).length : 0, 'arquivos');
+    console.log('[PostgresLocalStorage] Nome do diagrama:', data.diagramName);
     
     // Converter filesData de volta para BinaryFiles
     const files: BinaryFiles = {};
@@ -245,6 +256,7 @@ export const loadLocalSessionFromPostgres = async (): Promise<{
       elements: data.elements,
       appState: data.appState,
       files: Object.keys(files).length > 0 ? files : undefined,
+      diagramName: data.diagramName,
     };
   } catch (error) {
     console.error('Erro ao carregar sessão local do PostgreSQL:', error);
@@ -585,6 +597,9 @@ export const loadSessionVersion = async (versionId: number): Promise<{
   files?: BinaryFiles;
   versionNumber: number;
   createdAt: string;
+  diagramName?: string | null;
+  versionNote?: string | null;
+  sessionId?: string;
 } | null> => {
   const userId = getUserId();
   
@@ -625,6 +640,9 @@ export const loadSessionVersion = async (versionId: number): Promise<{
       files: Object.keys(files).length > 0 ? files : undefined,
       versionNumber: data.versionNumber,
       createdAt: data.createdAt,
+      diagramName: data.diagramName,
+      versionNote: data.versionNote,
+      sessionId: data.sessionId,
     };
   } catch (error) {
     console.error('Erro ao carregar versão:', error);

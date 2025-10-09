@@ -415,10 +415,58 @@ const ExcalidrawWrapper = () => {
       setCurrentDiagramName(event.detail.diagramName);
     };
     
+    // Listener para fork de diagrama (quando o nome muda)
+    const handleDiagramFork = async (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const newDiagramName = customEvent.detail.newDiagramName;
+      console.log('[App] Diagram fork event - novo nome:', newDiagramName);
+      
+      // Gerar novo session_id
+      const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+      console.log('[App] Criando novo session_id:', newSessionId);
+      
+      // Atualizar session_id no sessionStorage (não localStorage!)
+      sessionStorage.setItem("excalidraw-session-id", newSessionId);
+      console.log('[App] Session ID atualizado no sessionStorage');
+      
+      // Atualizar estado do diagrama
+      setCurrentDiagramName(newDiagramName);
+      
+      // Salvar no PostgreSQL com o novo nome e session_id
+      if (excalidrawAPI) {
+        const elements = excalidrawAPI.getSceneElements();
+        const appState = excalidrawAPI.getAppState();
+        const files = excalidrawAPI.getFiles();
+        
+        const { saveSessionVersion, saveLocalSessionToPostgres } = await import("./data/PostgresLocalStorage");
+        
+        // 1. Salvar sessão local com novo nome e arquivos atuais
+        //    skipFileLoad=true evita carregar arquivos do session_id antigo
+        await saveLocalSessionToPostgres(elements, appState, files, newDiagramName, true);
+        console.log('[App] Sessão local salva com novo session_id e nome:', newDiagramName);
+        
+        // 2. Salvar primeira versão do novo diagrama
+        await saveSessionVersion(
+          elements,
+          appState,
+          files,
+          false,
+          newDiagramName,
+          "Primeira versão após fork"
+        );
+        console.log('[App] Primeira versão salva após fork');
+      }
+      
+      // Reiniciar controle de sessão com novo session_id
+      hasActiveControlRef.current = false;
+    };
+    
     window.addEventListener('diagram-name-changed', handleDiagramNameChanged as EventListener);
+    window.addEventListener('diagram-fork', handleDiagramFork);
     
     return () => {
       window.removeEventListener('diagram-name-changed', handleDiagramNameChanged as EventListener);
+      window.removeEventListener('diagram-fork', handleDiagramFork);
     };
   }, [currentUsername]);
 
@@ -495,17 +543,29 @@ const ExcalidrawWrapper = () => {
     } else {
       // Carregar desenho remoto, descartar local
       try {
-        excalidrawAPI?.updateScene({
-          elements: sessionChoiceData.remoteElements,
-          appState: sessionChoiceData.remoteAppState as AppState,
-        });
+        const remoteData = await loadLocalSessionFromPostgres();
         
-        // Atualizar arquivos separadamente
-        if (sessionChoiceData.remoteFiles && Object.keys(sessionChoiceData.remoteFiles).length > 0) {
-          excalidrawAPI?.addFiles(Object.values(sessionChoiceData.remoteFiles));
+        if (remoteData) {
+          excalidrawAPI?.updateScene({
+            elements: remoteData.elements,
+            appState: remoteData.appState as AppState,
+          });
+          
+          // Atualizar arquivos separadamente
+          if (remoteData.files && Object.keys(remoteData.files).length > 0) {
+            excalidrawAPI?.addFiles(Object.values(remoteData.files));
+          }
+          
+          // Emitir evento com o nome do diagrama se disponível
+          if (remoteData.diagramName) {
+            window.dispatchEvent(new CustomEvent('diagram-loaded', {
+              detail: { diagramName: remoteData.diagramName }
+            }));
+            console.log('Diagrama carregado:', remoteData.diagramName);
+          }
+          
+          console.log('Desenho remoto carregado, local descartado');
         }
-        
-        console.log('Desenho remoto carregado, local descartado');
       } catch (error) {
         console.error('Erro ao carregar desenho remoto:', error);
       }
@@ -543,6 +603,12 @@ const ExcalidrawWrapper = () => {
       const versionData = await loadSessionVersion(versionId);
       
       if (versionData) {
+        // IMPORTANTE: Restaurar o session_id original da versão
+        if (versionData.sessionId) {
+          sessionStorage.setItem("excalidraw-session-id", versionData.sessionId);
+          console.log('[App] Session ID restaurado para:', versionData.sessionId);
+        }
+        
         excalidrawAPI?.updateScene({
           elements: versionData.elements,
           appState: versionData.appState as AppState,
@@ -551,6 +617,17 @@ const ExcalidrawWrapper = () => {
         // Atualizar arquivos
         if (versionData.files && Object.keys(versionData.files).length > 0) {
           excalidrawAPI?.addFiles(Object.values(versionData.files));
+        }
+        
+        // Emitir evento com o nome do diagrama se disponível
+        if (versionData.diagramName) {
+          window.dispatchEvent(new CustomEvent('diagram-loaded', {
+            detail: { 
+              diagramName: versionData.diagramName,
+              versionNote: versionData.versionNote
+            }
+          }));
+          console.log('Diagrama carregado:', versionData.diagramName);
         }
         
         console.log('Versão restaurada com sucesso');
@@ -625,22 +702,24 @@ const ExcalidrawWrapper = () => {
   const handleLogout = async () => {
     // Liberar sessão antes de deslogar
     if (currentUsername && !isViewOnlyMode) {
-      const { releaseActiveSession, saveSessionVersion } = await import("./data/PostgresLocalStorage");
+      const { releaseActiveSession, saveSessionVersion, getCurrentDiagramName } = await import("./data/PostgresLocalStorage");
       
       // Salvar estado atual
       const elements = excalidrawAPI?.getSceneElements();
       const appState = excalidrawAPI?.getAppState();
       const files = excalidrawAPI?.getFiles();
+      const diagramName = await getCurrentDiagramName();
       
-      if (elements && appState) {
+      if (elements && appState && diagramName) {
         await saveSessionVersion(
           elements,
           appState,
           files || {},
-          false,
-          undefined,
+          true, // isAutoSave = true
+          diagramName,
           "Salvamento automático ao sair"
         );
+        console.log('[App] Versão salva ao fazer logout com nome:', diagramName);
       }
       
       await releaseActiveSession();
@@ -791,22 +870,26 @@ const ExcalidrawWrapper = () => {
   useEffect(() => {
     const handleBeforeUnload = async () => {
       if (currentUsername && !isViewOnlyMode && excalidrawAPI) {
-        const { releaseActiveSession, saveSessionVersion } = await import("./data/PostgresLocalStorage");
+        const { releaseActiveSession, saveSessionVersion, getCurrentDiagramName } = await import("./data/PostgresLocalStorage");
         
         // Salvar estado atual antes de sair
         const elements = excalidrawAPI.getSceneElements();
         const appState = excalidrawAPI.getAppState();
         const files = excalidrawAPI.getFiles();
+        const diagramName = await getCurrentDiagramName();
         
-        if (elements && appState) {
+        if (elements && appState && diagramName) {
           await saveSessionVersion(
             elements,
             appState,
             files || {},
-            false,
-            undefined,
+            true, // isAutoSave = true
+            diagramName,
             "Salvamento automático ao fechar"
           );
+          console.log('[App] Versão salva antes de fechar com nome:', diagramName);
+        } else {
+          console.log('[App] Salvamento ao fechar ignorado - sem nome do diagrama');
         }
         
         await releaseActiveSession();
@@ -868,14 +951,24 @@ const ExcalidrawWrapper = () => {
 
         // Só salvar se houver conteúdo
         if (elements.length > 0) {
-          const { saveSessionVersion } = await import("./data/PostgresLocalStorage");
+          const { saveSessionVersion, getCurrentDiagramName } = await import("./data/PostgresLocalStorage");
+          const diagramName = await getCurrentDiagramName();
+          
+          // Se não houver nome, pedir para o usuário definir
+          if (!diagramName) {
+            console.log('[AutoSave] Diagrama sem nome - salvamento ignorado');
+            return;
+          }
+          
           await saveSessionVersion(
             elements,
             appState as AppState,
             files,
-            true // isAutoSave = true
+            true, // isAutoSave = true
+            diagramName,
+            "Salvamento automático ao fechar"
           );
-          console.log('[AutoSave] Versão automática salva com sucesso');
+          console.log('[AutoSave] Versão automática salva com sucesso com nome:', diagramName);
         }
       } catch (error) {
         console.error('[AutoSave] Erro ao salvar versão automática:', error);

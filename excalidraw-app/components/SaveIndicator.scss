@@ -39,6 +39,11 @@
       display: block;
       width: 100%;
       height: 100%;
+      
+      // Garantir que os paths sempre tenham cor visível
+      path {
+        stroke-opacity: 1;
+      }
     }
   }
 

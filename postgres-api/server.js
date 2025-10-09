@@ -69,6 +69,19 @@ async function initTables() {
       )
     `);
 
+    // Adicionar coluna diagram_name na local_sessions se não existir
+    await pool.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns 
+          WHERE table_name = 'local_sessions' AND column_name = 'diagram_name'
+        ) THEN
+          ALTER TABLE local_sessions ADD COLUMN diagram_name VARCHAR(255);
+        END IF;
+      END $$;
+    `);
+
     // Criar tabela de usuários se não existir
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -260,26 +273,28 @@ app.get('/scenes/:roomId', async (req, res) => {
 app.put('/local-sessions/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { elements, appState, files } = req.body;
+    const { elements, appState, files, diagramName } = req.body;
 
     if (!elements || !appState) {
       return res.status(400).json({ error: 'Dados incompletos' });
     }
 
     const result = await pool.query(`
-      INSERT INTO local_sessions (user_id, elements, app_state, files, updated_at)
-      VALUES ($1, $2, $3, $4, NOW())
+      INSERT INTO local_sessions (user_id, elements, app_state, files, diagram_name, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
       ON CONFLICT (user_id) DO UPDATE SET
         elements = EXCLUDED.elements,
         app_state = EXCLUDED.app_state,
         files = EXCLUDED.files,
+        diagram_name = EXCLUDED.diagram_name,
         updated_at = NOW()
       RETURNING *
     `, [
       userId, 
       JSON.stringify(elements), 
       JSON.stringify(appState),
-      JSON.stringify(files || {})
+      JSON.stringify(files || {}),
+      diagramName || null
     ]);
 
     res.status(200).json(result.rows[0]);
@@ -295,9 +310,23 @@ app.get('/local-sessions/:userId', async (req, res) => {
     const { userId } = req.params;
 
     const result = await pool.query(`
-      SELECT elements, app_state, files
-      FROM local_sessions
-      WHERE user_id = $1
+      SELECT 
+        ls.elements, 
+        ls.app_state, 
+        ls.files, 
+        COALESCE(
+          ls.diagram_name,
+          (
+            SELECT diagram_name 
+            FROM session_versions 
+            WHERE user_id = ls.user_id 
+            AND diagram_name IS NOT NULL 
+            ORDER BY created_at DESC 
+            LIMIT 1
+          )
+        ) as diagram_name
+      FROM local_sessions ls
+      WHERE ls.user_id = $1
     `, [userId]);
 
     if (result.rows.length === 0) {
@@ -309,6 +338,7 @@ app.get('/local-sessions/:userId', async (req, res) => {
       elements: JSON.parse(session.elements),
       appState: JSON.parse(session.app_state),
       files: session.files || {},
+      diagramName: session.diagram_name,
     });
   } catch (error) {
     console.error('Erro ao carregar sessão local:', error);
@@ -479,7 +509,7 @@ app.get('/local-sessions/:userId/versions/:versionId', async (req, res) => {
     const { userId, versionId } = req.params;
 
     const result = await pool.query(`
-      SELECT elements, app_state, files, version_number, created_at
+      SELECT elements, app_state, files, version_number, created_at, diagram_name, version_note, session_id
       FROM session_versions
       WHERE user_id = $1 AND id = $2
     `, [userId, versionId]);
@@ -495,6 +525,9 @@ app.get('/local-sessions/:userId/versions/:versionId', async (req, res) => {
       files: version.files || {},
       versionNumber: version.version_number,
       createdAt: version.created_at,
+      diagramName: version.diagram_name,
+      versionNote: version.version_note,
+      sessionId: version.session_id,
     });
   } catch (error) {
     console.error('Erro ao recuperar versão:', error);
